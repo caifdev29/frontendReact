@@ -10,7 +10,7 @@ const { Pool } = pkg;
 dotenv.config();
 
 const app = express();
-const allowedOrigins = (process.env.FRONTEND_ORIGIN || 'http://localhost:5173')
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || 'http://127.0.0.1:5500')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
