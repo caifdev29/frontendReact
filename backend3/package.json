@@ -1,0 +1,16 @@
+{
+  "name": "retail-pos-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "aws-sdk": "^2.1693.0",
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "jose": "^6.2.2",
+    "pg": "^8.20.0"
+  }
+}

@@ -1,0 +1,404 @@
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import pkg from 'pg';
+import AWS from 'aws-sdk';
+import crypto from 'crypto';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+const { Pool } = pkg;
+
+dotenv.config();
+
+const app = express();
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error('Origen no permitido por CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json());
+
+const cognitoRegion = process.env.COGNITO_REGION || process.env.AWS_REGION;
+const cognitoUserPoolId = process.env.COGNITO_USER_POOL_ID;
+const cognitoClientId = process.env.COGNITO_CLIENT_ID;
+const cognitoClientSecret = process.env.COGNITO_CLIENT_SECRET;
+
+if (cognitoRegion) {
+  AWS.config.update({ region: cognitoRegion });
+}
+
+const cognito = new AWS.CognitoIdentityServiceProvider();
+
+const cognitoIssuer = cognitoRegion && cognitoUserPoolId
+  ? `https://cognito-idp.${cognitoRegion}.amazonaws.com/${cognitoUserPoolId}`
+  : null;
+
+const jwks = cognitoIssuer
+  ? createRemoteJWKSet(new URL(`${cognitoIssuer}/.well-known/jwks.json`))
+  : null;
+
+function buildSecretHash(username) {
+  if (!cognitoClientSecret || !cognitoClientId) {
+    return undefined;
+  }
+
+  return crypto
+    .createHmac('sha256', cognitoClientSecret)
+    .update(`${username}${cognitoClientId}`)
+    .digest('base64');
+}
+
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
+async function verifyCognitoToken(req, res, next) {
+  if (!cognitoIssuer || !jwks) {
+    return res.status(500).json({
+      error: 'Cognito no configurado',
+      missing: ['COGNITO_REGION/AWS_REGION', 'COGNITO_USER_POOL_ID']
+    });
+  }
+
+  const authHeader = req.headers.authorization || '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Falta token Bearer' });
+  }
+
+  const token = authHeader.slice(7).trim();
+  if (!token) {
+    return res.status(401).json({ error: 'Token vacio' });
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, jwks, { issuer: cognitoIssuer });
+    const tokenUse = payload.token_use;
+
+    if (cognitoClientId) {
+      if (tokenUse === 'id' && payload.aud !== cognitoClientId) {
+        return res.status(401).json({ error: 'aud invalido para client id' });
+      }
+      if (tokenUse === 'access' && payload.client_id !== cognitoClientId) {
+        return res.status(401).json({ error: 'client_id invalido' });
+      }
+    }
+
+    req.user = payload;
+    return next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Token invalido o expirado' });
+  }
+}
+
+app.get('/public', (req, res) => {
+  res.json({ message: 'Endpoint publico activo' });
+});
+
+app.get('/private', verifyCognitoToken, (req, res) => {
+  res.json({
+    message: 'Endpoint privado autorizado',
+    sub: req.user?.sub,
+    username: req.user?.username || req.user?.['cognito:username']
+  });
+});
+
+app.post('/auth/register', async (req, res) => {
+  if (!cognitoClientId) {
+    return res.status(500).json({ error: 'Falta COGNITO_CLIENT_ID' });
+  }
+
+  const { username, password, email, name } = req.body || {};
+  if (!username || !password || !email) {
+    return res.status(400).json({ error: 'username, password y email son requeridos' });
+  }
+
+  const secretHash = buildSecretHash(username);
+  const userAttributes = [{ Name: 'email', Value: email }];
+  if (name) {
+    userAttributes.push({ Name: 'name', Value: name });
+  }
+
+  try {
+    const signUpResult = await cognito.signUp({
+      ClientId: cognitoClientId,
+      Username: username,
+      Password: password,
+      UserAttributes: userAttributes,
+      ...(secretHash ? { SecretHash: secretHash } : {})
+    }).promise();
+
+    return res.status(201).json({
+      message: 'Usuario registrado. Confirma el usuario para poder iniciar sesion.',
+      userSub: signUpResult.UserSub,
+      userConfirmed: signUpResult.UserConfirmed
+    });
+  } catch (error) {
+    return res.status(400).json({
+      error: error.code || 'RegisterError',
+      message: error.message
+    });
+  }
+});
+
+app.post('/auth/confirm', async (req, res) => {
+  if (!cognitoClientId) {
+    return res.status(500).json({ error: 'Falta COGNITO_CLIENT_ID' });
+  }
+
+  const { username, code } = req.body || {};
+  if (!username || !code) {
+    return res.status(400).json({ error: 'username y code son requeridos' });
+  }
+
+  const secretHash = buildSecretHash(username);
+
+  try {
+    await cognito.confirmSignUp({
+      ClientId: cognitoClientId,
+      Username: username,
+      ConfirmationCode: code,
+      ...(secretHash ? { SecretHash: secretHash } : {})
+    }).promise();
+
+    return res.json({
+      message: 'Usuario confirmado correctamente. Ya puedes iniciar sesion.'
+    });
+  } catch (error) {
+    return res.status(400).json({
+      error: error.code || 'ConfirmError',
+      message: error.message
+    });
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  if (!cognitoClientId) {
+    return res.status(500).json({ error: 'Falta COGNITO_CLIENT_ID' });
+  }
+
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'username y password son requeridos' });
+  }
+
+  const secretHash = buildSecretHash(username);
+  const authParameters = {
+    USERNAME: username,
+    PASSWORD: password,
+    ...(secretHash ? { SECRET_HASH: secretHash } : {})
+  };
+
+  try {
+    const response = await cognito.initiateAuth({
+      AuthFlow: 'USER_PASSWORD_AUTH',
+      ClientId: cognitoClientId,
+      AuthParameters: authParameters
+    }).promise();
+
+    if (!response.AuthenticationResult) {
+      return res.status(401).json({
+        error: 'ChallengeRequired',
+        challengeName: response.ChallengeName
+      });
+    }
+
+    return res.json({
+      accessToken: response.AuthenticationResult.AccessToken,
+      idToken: response.AuthenticationResult.IdToken,
+      refreshToken: response.AuthenticationResult.RefreshToken,
+      expiresIn: response.AuthenticationResult.ExpiresIn,
+      tokenType: response.AuthenticationResult.TokenType
+    });
+  } catch (error) {
+    return res.status(401).json({
+      error: error.code || 'LoginError',
+      message: error.message
+    });
+  }
+});
+
+app.get('/users', verifyCognitoToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, cognito_sub, username, email, full_name, password_hash, is_active, created_at, updated_at
+      FROM users
+      ORDER BY id DESC
+    `);
+    return res.json(result.rows);
+  } catch (error) {
+    return res.status(500).json({ error: 'Error listando usuarios', message: error.message });
+  }
+});
+
+app.post('/users', verifyCognitoToken, async (req, res) => {
+  const { cognito_sub, username, email, full_name, password_hash, is_active } = req.body || {};
+  if (!username || !email) {
+    return res.status(400).json({ error: 'username y email son requeridos' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO users (cognito_sub, username, email, full_name, password_hash, is_active)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, true))
+       RETURNING id, cognito_sub, username, email, full_name, password_hash, is_active, created_at, updated_at`,
+      [cognito_sub || null, username, email, full_name || null, password_hash || null, is_active]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    return res.status(400).json({ error: 'Error creando usuario', message: error.message });
+  }
+});
+
+app.put('/users/:id', verifyCognitoToken, async (req, res) => {
+  const { id } = req.params;
+  const { cognito_sub, username, email, full_name, password_hash, is_active } = req.body || {};
+  if (!username || !email) {
+    return res.status(400).json({ error: 'username y email son requeridos' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE users
+       SET cognito_sub = $1, username = $2, email = $3, full_name = $4, password_hash = $5, is_active = COALESCE($6, true)
+       WHERE id = $7
+       RETURNING id, cognito_sub, username, email, full_name, password_hash, is_active, created_at, updated_at`,
+      [cognito_sub || null, username, email, full_name || null, password_hash || null, is_active, id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    return res.json(result.rows[0]);
+  } catch (error) {
+    return res.status(400).json({ error: 'Error actualizando usuario', message: error.message });
+  }
+});
+
+app.delete('/users/:id', verifyCognitoToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING id', [id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    return res.json({ message: 'Usuario eliminado' });
+  } catch (error) {
+    return res.status(400).json({ error: 'Error eliminando usuario', message: error.message });
+  }
+});
+
+app.get('/products', verifyCognitoToken, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT id, sku, name, description, price, stock, is_active, created_at, updated_at
+      FROM products
+      ORDER BY id DESC
+    `);
+    return res.json(result.rows);
+  } catch (error) {
+    return res.status(500).json({ error: 'Error listando productos', message: error.message });
+  }
+});
+
+app.post('/products', verifyCognitoToken, async (req, res) => {
+  const { sku, name, description, price, stock, is_active } = req.body || {};
+  if (!sku || !name || price === undefined || stock === undefined) {
+    return res.status(400).json({ error: 'sku, name, price y stock son requeridos' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO products (sku, name, description, price, stock, is_active)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, true))
+       RETURNING id, sku, name, description, price, stock, is_active, created_at, updated_at`,
+      [sku, name, description || null, Number(price), Number(stock), is_active]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    return res.status(400).json({ error: 'Error creando producto', message: error.message });
+  }
+});
+
+app.put('/products/:id', verifyCognitoToken, async (req, res) => {
+  const { id } = req.params;
+  const { sku, name, description, price, stock, is_active } = req.body || {};
+  if (!sku || !name || price === undefined || stock === undefined) {
+    return res.status(400).json({ error: 'sku, name, price y stock son requeridos' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE products
+       SET sku = $1, name = $2, description = $3, price = $4, stock = $5, is_active = COALESCE($6, true)
+       WHERE id = $7
+       RETURNING id, sku, name, description, price, stock, is_active, created_at, updated_at`,
+      [sku, name, description || null, Number(price), Number(stock), is_active, id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Producto no encontrado' });
+    }
+    return res.json(result.rows[0]);
+  } catch (error) {
+    return res.status(400).json({ error: 'Error actualizando producto', message: error.message });
+  }
+});
+
+app.delete('/products/:id', verifyCognitoToken, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM products WHERE id = $1 RETURNING id', [id]);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Producto no encontrado' });
+    }
+    return res.json({ message: 'Producto eliminado' });
+  } catch (error) {
+    return res.status(400).json({ error: 'Error eliminando producto', message: error.message });
+  }
+});
+
+app.get('/time', verifyCognitoToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    res.json({ serverTime: result.rows[0].now });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Error conectando a la BD' });
+  }
+});
+
+const basePort = Number(process.env.PORT || 3000);
+
+function startServer(port) {
+  const server = app.listen(port, () => {
+    console.log(`Servidor corriendo en puerto ${port}`);
+  });
+
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      const nextPort = port + 1;
+      console.warn(`Puerto ${port} en uso, intentando ${nextPort}...`);
+      startServer(nextPort);
+      return;
+    }
+    throw err;
+  });
+}
+
+startServer(basePort);
